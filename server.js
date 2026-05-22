@@ -1,97 +1,122 @@
 const express = require('express');
-const Groq = require("groq-sdk");
+const path = require('path');
+const Razorpay = require('razorpay');
+const Groq = require('groq-sdk');
+const axios = require('axios');
+
 const app = express();
+const PORT = process.env.PORT || 3000; 
 
+// --- MIDDLEWARE (Engine ki settings) ---
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(__dirname)); 
 
-const PHONE_NUMBER_ID = "1106763835856433"; 
-const VERIFY_TOKEN = "ecom_agent_123"; 
+// --- KEYS & TOKENS (Render se exact match) ---
+const VERIFY_TOKEN = "deepesh_secret_token";
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN; 
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID; 
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY }); 
 
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-
-const groq = new Groq({ apiKey: GROQ_API_KEY });
-
-app.get('/webhook', (req, res) => {
-    res.status(200).send(req.query["hub.challenge"]);
+const razorpay = new Razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_SECRET
 });
 
+// --- ROUTES (Website ke raaste) ---
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+app.post('/login', (req, res) => res.redirect('/Dashboard.html'));
+app.post('/signup', (req, res) => res.redirect('/Dashboard.html'));
+
+// Razorpay Order Create
+app.post('/create-order', async (req, res) => {
+    try {
+        const order = await razorpay.orders.create({ amount: 50000, currency: "INR", receipt: "rcpt_1" });
+        res.json({ key_id: process.env.RAZORPAY_KEY_ID, amount: order.amount, order_id: order.id });
+    } catch (error) {
+        res.status(500).json({ error: "Gateway failed!" });
+    }
+});
+
+app.post('/verify-payment', (req, res) => res.json({ success: true }));
+
+
+// --- 🤖 WHATSAPP + GROQ AI WEBHOOK (The Brain) ---
+
+// 1. Meta Webhook Verification
+app.get('/webhook', (req, res) => {
+    let mode = req.query["hub.mode"];
+    let token = req.query["hub.verify_token"];
+    let challenge = req.query["hub.challenge"];
+    if (mode === "subscribe" && token === VERIFY_TOKEN) {
+        res.status(200).send(challenge);
+    } else {
+        res.sendStatus(403);
+    }
+});
+
+// 2. Incoming WhatsApp Messages & AI Auto-Reply
 app.post('/webhook', async (req, res) => {
     let body = req.body;
-
+    
     if (body.object === 'whatsapp_business_account') {
         try {
-            if (body.entry && body.entry[0].changes && body.entry[0].changes[0].value.messages) {
-                let from = body.entry[0].changes[0].value.messages[0].from;
-                let userMsg = body.entry[0].changes[0].value.messages[0].text.body;
-                console.log(`👤 User: ${userMsg}`);
+            let entry = body.entry[0];
+            let changes = entry.changes[0];
+            let value = changes.value;
+            
+            // Agar customer ka naya message aaya hai
+            if (value.messages && value.messages[0]) {
+                let message = value.messages[0];
+                let senderPhone = message.from;
+                let msgText = "";
 
-                const result = await groq.chat.completions.create({
-                    messages: [
-                        { role: "system", content: "You are a smart AI assistant. You help users with RTO, ecommerce, and general queries." },
-                        { role: "user", content: userMsg }
-                    ],
-                    model: "llama-3.3-70b-versatile",
-                });
+                if (message.type === "text") {
+                    msgText = message.text.body;
+                } else if (message.type === "interactive") {
+                    msgText = message.interactive.button_reply.title;
+                }
 
-                const aiReply = result.choices[0].message.content;
-                console.log(`🤖 AI: ${aiReply}`);
+                console.log(`📥 Naya Message (${senderPhone}):`, msgText);
 
-                const response = await fetch(`https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        messaging_product: "whatsapp",
-                        to: from,
-                        text: { body: aiReply }
-                    })
-                });
-                
-                const metaResult = await response.json();
-                console.log("📝 Meta ki Asli Report:", JSON.stringify(metaResult));
-                console.log("✅ Reply bhejne ka try kiya!");
+                if (msgText) {
+                    // 🧠 GROQ AI Dimaag (Now Strictly in Professional English)
+                    const chatCompletion = await groq.chat.completions.create({
+                        messages: [
+                            { role: "system", content: "You are a smart, professional Order Confirmation assistant. Keep your answers short, polite, and strictly in English." },
+                            { role: "user", content: msgText }
+                        ],
+                        model: "llama3-8b-8192", 
+                    });
+                    
+                    let aiResponse = chatCompletion.choices[0].message.content;
+
+                    // 📨 WhatsApp par reply wapas bhejna
+                    await axios({
+                        method: 'POST',
+                        url: `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+                        headers: {
+                            Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+                            'Content-Type': 'application/json'
+                        },
+                        data: {
+                            messaging_product: "whatsapp",
+                            to: senderPhone,
+                            type: "text",
+                            text: { body: aiResponse }
+                        }
+                    });
+                    console.log("✅ English AI Reply Bhej Diya!");
+                }
             }
-        } catch (err) {
-            console.log("❌ Error:", err.message);
+        } catch (error) {
+            console.error("❌ Error:", error.message);
         }
     }
-    res.sendStatus(200);
+    res.sendStatus(200); 
 });
 
-// New Order Confirmation Endpoint (Aapka Naya Code)
-app.post('/new-order', async (req, res) => {
-    try {
-        const { customerPhone, customerName, address, orderId, amount } = req.body;
-        
-        const message = `Namaste ${customerName}! 🛍️\n\nAapka order place hua hai!\n\n📦 Order ID: ${orderId}\n💰 Amount: ₹${amount}\n📍 Delivery Address: ${address}\n\nKya ye address sahi hai?\nReply karo:\n1 - Haan, address sahi hai ✅\n2 - Nahi, address change karna hai ❌`;
-
-        const response = await fetch(`https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                messaging_product: "whatsapp",
-                to: customerPhone,
-                text: { body: message }
-            })
-        });
-        
-        const metaResult = await response.json();
-        console.log("📦 Order Confirmation Bheja:", JSON.stringify(metaResult));
-        res.json({ success: true, message: "Order confirmation sent!", meta_response: metaResult });
-
-    } catch (err) {
-        console.log("❌ Error:", err.message);
-        res.json({ success: false, error: err.message });
-    }
-});
-
-const PORT = process.env.PORT || 3000;
+// --- ENGINE START ---
 app.listen(PORT, () => {
-    console.log(`🚀 Server is running on port ${PORT}`);
+    console.log(`BOMB! 💣 Server running on port ${PORT} 🚀`);
 });
